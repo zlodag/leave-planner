@@ -1,5 +1,4 @@
 # SMO-Only Radiologist Leave Data Extraction Script
-# Version 5.0 - Focuses on consultant/attending radiologists (SMOs)
 
 param(
     [Parameter(Mandatory=$false)]
@@ -9,10 +8,7 @@ param(
     [int]$MonthsAhead = 6,
     
     [Parameter(Mandatory=$false)]
-    [switch]$IncludePending = $true,
-    
-    [Parameter(Mandatory=$false)]
-    [int]$MinSMOShifts = 5  # Minimum SMO shifts to be considered an SMO
+    [switch]$ExcludePending
 )
 
 # Configuration
@@ -20,56 +16,15 @@ $ServerName = "MSCHCPSCHSQLP1"
 $DatabaseName = "PhySch"
 $ConnectionString = "Server=$ServerName;Database=$DatabaseName;Integrated Security=true;"
 
-# Leave-related shift patterns to extract
-$LeaveShiftPatterns = @(
-    "Annual Leave%",
-    "Annual leave%", 
-    "Leave Pending%",
-    "Sick%",
-    "CME Leave%",
-    "CME Travel%",
-    "Study Leave%",
-    "Parental Leave%",
-    "Sabbatical%",
-    "Bereavement%",
-    "Day in Lieu%",
-    "LWOP%",
-    "Peak Leave%"
-)
-
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-Host "[$Timestamp] [$Level] $Message"
 }
 
-function Convert-IntToTime {
-    param([int]$TimeInt)
-    try {
-        if ($TimeInt -eq 0) { return "00:00" }
-        $timeStr = $TimeInt.ToString().PadLeft(4, '0')
-        return "$($timeStr.Substring(0,2)):$($timeStr.Substring(2,2))"
-    }
-    catch {
-        return "00:00"
-    }
-}
-
-function Convert-IntToDate {
-    param([int]$DateInt)
-    try {
-        $dateStr = $DateInt.ToString().PadLeft(8, '0')
-        return [DateTime]::ParseExact($dateStr, "yyyyMMdd", $null)
-    }
-    catch {
-        Write-Log "Error converting date: $DateInt" "ERROR"
-        return $null
-    }
-}
-
 function Export-SMOLeaveData {
     Write-Log "Starting SMO leave data extraction..."
-    Write-Log "Parameters: OutputPath=$OutputPath, MonthsAhead=$MonthsAhead, MinSMOShifts=$MinSMOShifts"
+    Write-Log "Parameters: OutputPath=$OutputPath, MonthsAhead=$MonthsAhead"
     
     try {
         # Calculate date range
@@ -81,80 +36,52 @@ function Export-SMOLeaveData {
         Write-Log "Extracting leave data from $(Get-Date $StartDate -Format 'yyyy-MM-dd') to $(Get-Date $EndDate -Format 'yyyy-MM-dd')"
         
         # Build status filter
-        $StatusFilter = if ($IncludePending) { "r.Status IN (1,2)" } else { "r.Status = 2" }
-        
-        # Build leave shift pattern filter
-        $ShiftPatternFilter = ($LeaveShiftPatterns | ForEach-Object { "s.ShiftName LIKE '$_'" }) -join " OR "
-        
+        $StatusFilter = if ($ExcludePending) { "and Request.Status <> 1" } else { "" }
+                
         # SQL Query - Extract leave data for SMOs only
         $Query = @"
-        WITH SMOEmployees AS (
-            -- Identify SMOs based on their shift assignments
-            SELECT 
-                e.EmployeeID,
-                e.FirstName,
-                e.LastName,
-                COUNT(CASE WHEN s.ShiftName LIKE '%SMO%' THEN 1 END) as SMO_Shifts,
-                COUNT(*) as Total_Shifts
-            FROM Employee e
-            JOIN Request r ON e.EmployeeID = r.EmployeeID
-            JOIN Shift s ON r.ShiftID = s.ShiftID
-            WHERE r.IsAssignTo = 1 
-                AND r.Status = 2
-                AND r.StartDate >= 20250101
-            GROUP BY e.EmployeeID, e.FirstName, e.LastName
-            HAVING COUNT(CASE WHEN s.ShiftName LIKE '%SMO%' THEN 1 END) >= $MinSMOShifts
-        ),
-        SMOLeaveData AS (
-            -- Get leave data for identified SMOs
-            SELECT 
-                r.EmployeeID,
-                smo.FirstName,
-                smo.LastName,
-                smo.SMO_Shifts,
-                r.StartDate,
-                r.EndDate,
-                r.StartTime,
-                r.EndTime,
-                s.ShiftName,
-                s.IsOffTime,
-                r.Status,
-                r.Note,
-                CASE r.Status 
-                    WHEN 1 THEN 'Pending'
-                    WHEN 2 THEN 'Approved'
-                    WHEN 4 THEN 'Cancelled'
-                    ELSE 'Other'
-                END AS StatusText
-            FROM Request r
-            JOIN SMOEmployees smo ON r.EmployeeID = smo.EmployeeID
-            JOIN Shift s ON r.ShiftID = s.ShiftID
-            WHERE 
-                $StatusFilter
-                AND r.IsAssignTo = 1
-                AND ($ShiftPatternFilter)
-                AND (
-                    (r.StartDate >= $StartDateInt AND r.StartDate <= $EndDateInt)
-                    OR (r.EndDate >= $StartDateInt AND r.EndDate <= $EndDateInt)
-                    OR (r.StartDate <= $StartDateInt AND r.EndDate >= $EndDateInt)
-                )
-        )
-        SELECT 
-            EmployeeID,
-            FirstName,
-            LastName,
-            SMO_Shifts,
-            StartDate,
-            EndDate,
-            StartTime,
-            EndTime,
-            ShiftName,
-            IsOffTime,
-            Status,
-            StatusText,
-            Note
-        FROM SMOLeaveData
-        ORDER BY LastName, FirstName, StartDate, StartTime
+            select
+                Employee.EmployeeID,
+                FirstName,
+                LastName,
+                ShiftName,
+                datetime2fromparts(
+                    StartDate/10000,
+                    StartDate/100%100,
+                    StartDate%100,
+                    Request.StartTime%2400/100,
+                    Request.StartTime%100,
+                    0, 0, 0
+                ) as start,
+                datetime2fromparts(
+                    EndDate/10000,
+                    EndDate/100%100,
+                    EndDate%100,
+                    Request.EndTime%2400/100,
+                    Request.EndTime%100,
+                    0, 0, 0
+                ) as 'end',
+                case Status when 1 then 'Pending'
+                    when 2 then 'Approved'
+                    when 4 then 'Denied'
+                    when 8 then 'Waitlisted'
+                end as status
+                from Request
+            join Employee on Employee.EmployeeID = Request.EmployeeID
+            join Profile on Profile.ProfileID = Request.ProfileID
+            join Shift on Shift.ShiftID = Request.ShiftID and Shift.ProfileID = Profile.ProfileID
+            join Assignment on Assignment.AssignID = Shift.AssignID and Assignment.ProfileID = Profile.ProfileID
+            where Profile.Abbr = 'SMO' -- also 'Fellows', 'RMO'
+            -- and Employee.Abbr = 'xyz' -- for a single SMO
+            and Assignment.Abbr in ('Leave am', 'Leave pm')
+            and Request.Status <> 4 -- status is not 'denied'
+            $StatusFilter
+            and Request.IsAssignTo = 1 -- request is 'assign to' not 'block'
+            -- and Request.StartDate >= year(CURRENT_TIMESTAMP) * 10000 + month(CURRENT_TIMESTAMP) * 100 + day(CURRENT_TIMESTAMP) -- from today
+            -- and Request.StartDate >= year(CURRENT_TIMESTAMP) * 10000 -- from start of this year
+            and Request.StartDate <= $EndDateInt
+            and Request.EndDate >= $StartDateInt
+            order by Request.EmployeeId, Request.StartDate, Request.StartTime
 "@
 
         Write-Log "Connecting to database and identifying SMOs..."
@@ -173,50 +100,25 @@ function Export-SMOLeaveData {
         $SMOEmployees = @{}
         
         while ($Reader.Read()) {
-            $StartDateConverted = Convert-IntToDate $Reader["StartDate"]
-            $EndDateConverted = Convert-IntToDate $Reader["EndDate"]
-            
-            if ($null -eq $StartDateConverted -or $null -eq $EndDateConverted) {
-                continue
+
+            $LeaveRecord = @{
+                employee_id = $Reader["EmployeeID"]
+                shift_name = $Reader["ShiftName"]
+                start = $Reader["start"]
+                end = $Reader["end"]
+                full_name = "$($Reader['LastName']), $($Reader['FirstName'])"
+                status = $Reader["status"]
             }
-            
-            # Extract and clean field values
-            $employeeID = $Reader["EmployeeID"]
-            $firstName = if ([DBNull]::Value.Equals($Reader["FirstName"])) { "" } else { $Reader["FirstName"].ToString().Trim() }
-            $lastName = if ([DBNull]::Value.Equals($Reader["LastName"])) { "" } else { $Reader["LastName"].ToString().Trim() }
-            $smoShifts = $Reader["SMO_Shifts"]
-            $shiftName = if ([DBNull]::Value.Equals($Reader["ShiftName"])) { "" } else { $Reader["ShiftName"].ToString().Trim() }
-            $note = if ([DBNull]::Value.Equals($Reader["Note"])) { "" } else { $Reader["Note"].ToString().Trim() }
-            
+            $LeaveRecords += $LeaveRecord
+
             # Track SMO employees
-            if (-not $SMOEmployees.ContainsKey($employeeID)) {
-                $SMOEmployees[$employeeID] = @{
-                    full_name = "$lastName, $firstName"
-                    smo_shifts = $smoShifts
+            if (-not $SMOEmployees.ContainsKey($LeaveRecord["employee_id"])) {
+                $SMOEmployees[$LeaveRecord["employee_id"]] = @{
+                    full_name = $LeaveRecord["full_name"]
                 }
             }
-            
-            $LeaveRecord = @{
-                employee_id = $employeeID
-                first_name = $firstName
-                last_name = $lastName
-                full_name = "$lastName, $firstName"
-                smo_shifts = $smoShifts
-                start_date = Get-Date $StartDateConverted -Format "yyyy-MM-dd"
-                end_date = Get-Date $EndDateConverted -Format "yyyy-MM-dd"
-                start_time = Convert-IntToTime $(if ([DBNull]::Value.Equals($Reader["StartTime"])) { 0 } else { $Reader["StartTime"] })
-                end_time = Convert-IntToTime $(if ([DBNull]::Value.Equals($Reader["EndTime"])) { 0 } else { $Reader["EndTime"] })
-                shift_name = $shiftName
-                is_off_time = $Reader["IsOffTime"]
-                status = $Reader["Status"]
-                status_text = $Reader["StatusText"]
-                note = $note
-                extracted_at = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            }
-            
-            $LeaveRecords += $LeaveRecord
+
             $RecordCount++
-            
             if ($RecordCount % 100 -eq 0) {
                 Write-Log "Processed $RecordCount leave records..."
             }
@@ -229,31 +131,14 @@ function Export-SMOLeaveData {
         
         # Group by employee for summary
         $StaffSummary = $LeaveRecords | Group-Object employee_id | ForEach-Object {
-            $staffLeave = $_.Group
-            $totalDays = 0
-            
-            # Calculate total leave days
-            $leaveByDate = $staffLeave | Group-Object start_date
-            foreach ($dateGroup in $leaveByDate) {
-                $shiftsOnDate = $dateGroup.Group
-                $hasAM = ($shiftsOnDate | Where-Object { $_.shift_name -like "*am*" }).Count -gt 0
-                $hasPM = ($shiftsOnDate | Where-Object { $_.shift_name -like "*pm*" }).Count -gt 0
-                
-                if ($hasAM -and $hasPM) {
-                    $totalDays += 1
-                } elseif ($hasAM -or $hasPM) {
-                    $totalDays += 0.5
-                }
-            }
-            
+           
             @{
-                employee_id = $_.Name
+                employee_id = [int]$_.Name
                 full_name = $_.Group[0].full_name
-                smo_shifts = $_.Group[0].smo_shifts
-                total_leave_days = $totalDays
+                total_leave_days = $_.Group.Count * .5
                 leave_shifts = $_.Group.Count
-                approved_shifts = ($_.Group | Where-Object { $_.status -eq 2 }).Count
-                pending_shifts = ($_.Group | Where-Object { $_.status -eq 1 }).Count
+                approved_shifts = ($_.Group | Where-Object { $_.status -eq 'Approved' }).Count
+                pending_shifts = ($_.Group | Where-Object { $_.status -eq 'Pending' }).Count
                 leave_types = ($_.Group | Select-Object shift_name -Unique | ForEach-Object { $_.shift_name }) -join ", "
             }
         }
@@ -267,13 +152,10 @@ function Export-SMOLeaveData {
                     end = Get-Date $EndDate -Format "yyyy-MM-dd"
                 }
                 filter_criteria = @{
-                    role_type = "SMO (Senior Medical Officer/Consultant)"
-                    min_smo_shifts = $MinSMOShifts
-                    include_pending = $IncludePending
+                    exclude_pending = $ExcludePending.ToBool()
                 }
                 total_leave_shifts = $RecordCount
                 unique_smo_staff = $SMOEmployees.Count
-                leave_shift_patterns = $LeaveShiftPatterns
                 database_info = @{
                     server = $ServerName
                     database = $DatabaseName
@@ -298,8 +180,8 @@ function Export-SMOLeaveData {
         
         if ($StaffSummary.Count -gt 0) {
             Write-Host "`n=== SMO RADIOLOGISTS IDENTIFIED ===" -ForegroundColor Yellow
-            $SMOEmployees.Values | Sort-Object { $_.full_name } | ForEach-Object {
-                Write-Host "$($_.full_name) - $($_.smo_shifts) SMO shifts" -ForegroundColor White
+            $StaffSummary | Sort-Object full_name | ForEach-Object {
+                Write-Host "$($_.full_name) - $($_.leave_shifts) shifts" -ForegroundColor White
             }
             
             Write-Host "`n=== TOP SMOs BY LEAVE DAYS ===" -ForegroundColor Yellow
@@ -329,7 +211,7 @@ try {
     
     Write-Host "`nSMO leave data extraction completed successfully!" -ForegroundColor Green
     Write-Host "Data saved to: $OutputPath" -ForegroundColor Cyan
-    Write-Host "`nThis data contains only consultant/attending radiologists (SMOs)" -ForegroundColor Yellow
+    Write-Host "`nThis data contains only consultant radiologists (SMOs)" -ForegroundColor Yellow
     Write-Host "Perfect for your 2-radiologist weekly roster system!" -ForegroundColor Yellow
     
     exit 0
