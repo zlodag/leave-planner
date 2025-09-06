@@ -6,7 +6,10 @@ param(
     
     [Parameter(Mandatory=$false)]
     [int]$MonthsAhead = 6,
-    
+
+    [Parameter(Mandatory=$false)]
+    [switch]$ExcludeFellows,
+
     [Parameter(Mandatory=$false)]
     [switch]$ExcludePending
 )
@@ -37,6 +40,7 @@ function Export-SMOLeaveData {
         
         # Build status filter
         $StatusFilter = if ($ExcludePending) { "and Request.Status <> 1" } else { "" }
+        $ProfileFilter = if ($ExcludeFellows) { "ProfileName = 'SMO'" } else { "ProfileName in ('Fellows', 'SMO')" }
                 
         # SQL Query - Extract leave data for SMOs only
         $Query = @"
@@ -71,9 +75,9 @@ function Export-SMOLeaveData {
             join Profile on Profile.ProfileID = Request.ProfileID
             join Shift on Shift.ShiftID = Request.ShiftID and Shift.ProfileID = Profile.ProfileID
             join Assignment on Assignment.AssignID = Shift.AssignID and Assignment.ProfileID = Profile.ProfileID
-            where Profile.Abbr = 'SMO' -- also 'Fellows', 'RMO'
+            where $ProfileFilter
             -- and Employee.Abbr = 'xyz' -- for a single SMO
-            and Assignment.Abbr in ('Leave am', 'Leave pm')
+            and AssignName like '%Leave%'
             and Request.Status <> 4 -- status is not 'denied'
             $StatusFilter
             and Request.IsAssignTo = 1 -- request is 'assign to' not 'block'
@@ -103,10 +107,10 @@ function Export-SMOLeaveData {
 
             $LeaveRecord = @{
                 employee_id = $Reader["EmployeeID"]
+                full_name = "$($Reader['LastName']), $($Reader['FirstName'])"
                 shift_name = $Reader["ShiftName"]
                 start = $Reader["start"]
                 end = $Reader["end"]
-                full_name = "$($Reader['LastName']), $($Reader['FirstName'])"
                 status = $Reader["status"]
             }
             $LeaveRecords += $LeaveRecord
@@ -130,11 +134,11 @@ function Export-SMOLeaveData {
         Write-Log "Extracted $RecordCount leave records from $($SMOEmployees.Count) SMO radiologists"
         
         # Group by employee for summary
-        $StaffSummary = $LeaveRecords | Group-Object employee_id | ForEach-Object {
+        $StaffSummary = $LeaveRecords | Group-Object full_name | ForEach-Object {
            
             @{
-                employee_id = [int]$_.Name
-                full_name = $_.Group[0].full_name
+                employee_id = $_.Group[0].employee_id
+                full_name = $_.Name
                 total_leave_days = $_.Group.Count * .5
                 leave_shifts = $_.Group.Count
                 approved_shifts = ($_.Group | Where-Object { $_.status -eq 'Approved' }).Count
@@ -153,6 +157,7 @@ function Export-SMOLeaveData {
                 }
                 filter_criteria = @{
                     exclude_pending = $ExcludePending.ToBool()
+                    exclude_fellows = $ExcludeFellows.ToBool()
                 }
                 total_leave_shifts = $RecordCount
                 unique_smo_staff = $SMOEmployees.Count
@@ -180,7 +185,7 @@ function Export-SMOLeaveData {
         
         if ($StaffSummary.Count -gt 0) {
             Write-Host "`n=== SMO RADIOLOGISTS IDENTIFIED ===" -ForegroundColor Yellow
-            $StaffSummary | Sort-Object full_name | ForEach-Object {
+            $StaffSummary | ForEach-Object {
                 Write-Host "$($_.full_name) - $($_.leave_shifts) shifts" -ForegroundColor White
             }
             
